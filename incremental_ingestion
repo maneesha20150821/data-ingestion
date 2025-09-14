@@ -1,0 +1,85 @@
+import requests
+import csv
+from datetime import datetime
+import boto3
+from io import StringIO
+
+# Config
+DATASTORE_RESOURCE_ID = "3e6d5f6a-055c-440d-a690-fc0537c31095"
+CSV_FILE_LOCAL = "data.csv"
+S3_BUCKET = "your-bucket-name"  # replace with your bucket
+S3_KEY = "P4/data.csv"          # path in bucket
+
+# Create S3 client using your SSO profile
+session = boto3.Session(profile_name="maneesha")
+s3 = session.client("s3")
+
+# Read last ingested date
+try:
+    with open("last_date.txt", "r") as f:
+        last_date = datetime.strptime(f.read().strip(), "%Y-%m-%d").date()
+except FileNotFoundError:
+    last_date = datetime.strptime("2000-01-01", "%Y-%m-%d").date()
+
+print(f"Last ingested date: {last_date}")
+
+# Pagination
+offset = 0
+limit = 1000
+new_rows = []
+
+while True:
+    url = f"https://data.nsw.gov.au/data/api/3/action/datastore_search"
+    params = {
+        "resource_id": DATASTORE_RESOURCE_ID,
+        "limit": limit,
+        "offset": offset,
+    }
+    response = requests.get(url, params=params)
+    response.raise_for_status()
+    records = response.json()["result"]["records"]
+    
+    # Filter new rows
+    batch_new = [
+        r for r in records
+        if datetime.strptime(r["Date_extracted"], "%Y-%m-%d").date() > last_date
+    ]
+    new_rows.extend(batch_new)
+    
+    if len(records) < limit:
+        break
+    offset += limit
+
+print(f"Total new rows to ingest: {len(new_rows)}")
+
+# Save to CSV locally and upload to S3
+if new_rows:
+    keys = new_rows[0].keys()
+    # Save locally
+    with open(CSV_FILE_LOCAL, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=keys)
+        if f.tell() == 0:
+            writer.writeheader()
+        writer.writerows(new_rows)
+
+    # Upload to S3
+    csv_buffer = StringIO()
+    writer = csv.DictWriter(csv_buffer, fieldnames=keys)
+    writer.writeheader()
+    writer.writerows(new_rows)
+
+    try:
+        s3.put_object(Bucket=S3_BUCKET, Key=S3_KEY, Body=csv_buffer.getvalue())
+        print("Upload to S3 successful")
+    except Exception as e:
+        print("Upload failed:", e)
+
+    # Update last_date.txt
+    max_date = max(datetime.strptime(r["Date_extracted"], "%Y-%m-%d").date() for r in new_rows)
+    with open("last_date.txt", "w") as f:
+        f.write(max_date.strftime("%Y-%m-%d"))
+
+    print(f"Updated last ingested date to: {max_date}")
+else:
+    print("No new data to ingest.")
+
